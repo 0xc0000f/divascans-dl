@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -34,8 +35,13 @@ IMG_TIMEOUT = int(os.environ.get("DV_IMG_TIMEOUT", "45"))
 DL_WORKERS = int(os.environ.get("DV_WORKERS", "8"))
 IMG_TTL = int(os.environ.get("DV_IMG_TTL", "600"))
 
-os.makedirs(os.path.join(DATA_DIR, "downloads"), exist_ok=True)
-os.makedirs(os.path.join(DATA_DIR, "zips"), exist_ok=True)
+for _d in ("downloads", "zips", "covers"):
+    try:
+        os.makedirs(os.path.join(DATA_DIR, _d), exist_ok=True)
+    except FileExistsError:  # dangling symlink left by a moved cache
+        pass
+    if not os.path.isdir(os.path.join(DATA_DIR, _d)):
+        log("WARN", f"DATA_DIR/{_d} is not a directory — writes there will fail")
 
 SERIAL_RE = re.compile(r"/series/(comic|novel)/([a-z0-9\-]+)/chapter/([0-9]+)")
 SERIES_RE = re.compile(r"/series/(comic|novel)/([a-z0-9\-]+)")
@@ -82,7 +88,7 @@ def fetch_chapters(slug, fmt, force=False):
         hit = TL.get(key)
     if hit and not force and hit[0] > now:
         return hit[1], hit[2]
-    out, page = [], 1
+    out, page, nsfw, counts = [], 1, False, {}
     while True:
         r = requests.get(
             f"{BASE}/api/ai/series/{slug}/chapters",
@@ -93,6 +99,8 @@ def fetch_chapters(slug, fmt, force=False):
         if r.status_code != 200:
             return r.status_code, {"error": f"ai endpoint {r.status_code}"}
         j = r.json()
+        nsfw = nsfw or bool((j.get("series") or {}).get("is_nsfw"))
+        counts = j.get("counts") or counts
         for c in j.get("chapters") or []:
             out.append({
                 "n": c.get("number"),
@@ -109,7 +117,9 @@ def fetch_chapters(slug, fmt, force=False):
             break
     for c in out:
         c["cached"] = chapter_cached(slug, c["n"])
-    body = {"slug": slug, "fmt": fmt, "chapters": out,
+        if not c["free"]:
+            c["eta"] = max(1, c["n"] - (counts.get("free") or 0))
+    body = {"slug": slug, "fmt": fmt, "chapters": out, "nsfw": nsfw, "counts": counts,
             "total": len(out), "free": sum(1 for c in out if c["free"])}
     with LOCK:
         TL[key] = (now + IMG_TTL, 200, body)
@@ -364,6 +374,30 @@ def api_series():
     return jsonify({"items": out})
 
 
+_DESC_TTL, _desc_cache = 3600, {}
+
+
+def series_desc(slug):
+    """Series synopsis from the SSR page's og:description (cached)."""
+    now = time.time()
+    hit = _desc_cache.get(slug)
+    if hit and hit[0] > now:
+        return hit[1]
+    desc = ""
+    try:
+        r = requests.get(f"{BASE}/series/{series_fmt(slug)}/{slug}",
+                         headers={"User-Agent": UA_PAGE}, timeout=30)
+        m = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)',
+                      r.text) or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description', r.text)
+        if m:
+            import html as _h
+            desc = _h.unescape(m.group(1)).strip()
+    except Exception as e:  # noqa: BLE001
+        log("desc error", slug, repr(e)[:100])
+    _desc_cache[slug] = (now + _DESC_TTL, desc)
+    return desc
+
+
 @app.get("/api/series/<slug>")
 def api_one_series(slug):
     if slug not in CATALOG and not re.fullmatch(r"[a-z0-9\-]+", slug):
@@ -374,6 +408,7 @@ def api_one_series(slug):
         return jsonify(body), st
     body["catalog"] = catalog_row(slug)
     body["fmt"] = fmt
+    body["desc"] = series_desc(slug)
     return jsonify(body)
 
 
@@ -410,9 +445,12 @@ def api_job_zip(key):
     if not j or j["status"] != "done":
         abort(404)
     fn = os.path.basename(j.get("zname") or "download.zip")
+    ascii_fn = re.sub(r"[^A-Za-z0-9._ -]", "", fn)[:70].strip() or "download.zip"
+    quoted = urllib.parse.quote(fn)
     data = open(j["zpath"], "rb").read()
     return Response(data, mimetype="application/zip",
-                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{fn}"})
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{ascii_fn}"; filename*=UTF-8\'\'{quoted}'})
 
 
 @app.post("/api/job/<key>/stop")
@@ -456,15 +494,31 @@ def proxy_img(url):
 
 @app.get("/cover/<slug>")
 def cover(slug):
-    """Stream the series og-image through us (needs browser UA, browser img can't send Referer)."""
+    """Series og-image, cached on disk (browser img can't send the Referer CF wants)."""
     if not re.fullmatch(r"[a-z0-9\-]+", slug):
         abort(404)
+    cdir = os.path.join(DATA_DIR, "covers")
+    os.makedirs(cdir, exist_ok=True)
+    ext = next((e for e in ("webp", "png", "jpg")
+                if os.path.exists(os.path.join(cdir, f"{slug}.{e}"))), None)
+    if ext:
+        with open(os.path.join(cdir, f"{slug}.{ext}"), "rb") as fh:
+            data = fh.read()
+        return Response(data, mimetype=f"image/{'jpeg' if ext == 'jpg' else ext}",
+                        headers={"Cache-Control": "public, max-age=86400"})
     r = requests.get(f"{BASE}/series/{series_fmt(slug)}/{slug}/opengraph-image",
                      headers={"User-Agent": UA_PAGE, "Referer": BASE + "/"},
                      timeout=30)
     if r.status_code != 200:
         abort(404)
-    return Response(r.content, mimetype=r.headers.get("Content-Type", "image/png"),
+    ctype = r.headers.get("Content-Type", "image/png")
+    ext = {"image/webp": "webp", "image/jpeg": "jpg"}.get(ctype, "png")
+    try:
+        with open(os.path.join(cdir, f"{slug}.{ext}"), "wb") as fh:
+            fh.write(r.content)
+    except OSError:
+        pass
+    return Response(r.content, mimetype=ctype,
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
@@ -490,120 +544,144 @@ def api_feed():
     return jsonify({"events": out})
 
 
-PAGE = """<!doctype html><html lang=th><meta charset=utf-8>
+PAGE = r"""<!doctype html><html lang=th><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>divascans-dl</title>
+<title>DIVASCANS DL</title>
+<meta name=description content="divascans.org episode ZIP downloader">
 <style>
-body{font-family:system-ui,sans-serif;background:#12141a;color:#e7eaf0;margin:0;padding:24px}
-.wrap{max-width:900px;margin:auto}
-h1{font-size:22px;margin:0 0 4px}
-.sub{color:#8996a3;font-size:13px;margin-bottom:18px}
-input[type=text]{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:8px;border:1px solid #2a2f3a;background:#1b1f28;color:#e7eaf0;font-size:15px}
-button{background:#3d6df0;border:0;color:#fff;padding:10px 14px;border-radius:8px;font-size:14px;cursor:pointer;margin-top:8px}
-button.ghost{background:#262c38}
-button:disabled{opacity:.45;cursor:default}
-.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.card{display:flex;gap:12px;padding:12px;background:#1b1f28;border-radius:10px;margin-top:8px;cursor:pointer;align-items:center}
-.card:hover{background:#222835}
-.card img{width:48px;height:60px;object-fit:cover;border-radius:6px;background:#0d0f14}
-.meta{color:#8996a3;font-size:12px}
-.pill{background:#262c38;border-radius:20px;padding:2px 8px;font-size:11px;color:#9fb3d1;margin-left:6px}
-.pill.f{color:#7fe0a0}.pill.p{color:#e6b06b}
-.rows{margin-top:14px;border-top:1px solid #242a35}
-.ep{display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:1px solid #1d222c}
-.ep input{width:16px;height:16px}
-.ep .num{width:56px;color:#9fb3d1;font-variant-numeric:tabular-nums}
-.prog{margin:14px 0;background:#1b1f28;border-radius:8px;height:26px;position:relative;display:none}
-.prog i{position:absolute;left:0;top:0;bottom:0;background:#3d6df0;border-radius:8px;width:0}
-.prog span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px}
-.err{color:#f28b82;font-size:12px;margin:6px 0;white-space:pre-wrap}
-a.zipbtn{background:#2f9e63;border-radius:8px;padding:10px 14px;color:#fff;text-decoration:none;font-size:14px;display:inline-block;margin-top:8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-top:12px}
-.grid img{width:100%;border-radius:6px;background:#0d0f14;min-height:40px}
-.back{color:#7fa5f5;cursor:pointer;font-size:13px;margin-bottom:8px;display:inline-block}
-.chip{font-size:11px;background:#262c38;border-radius:6px;padding:2px 7px;color:#9fb3d1;cursor:pointer}
-</style>
-<div class=wrap>
-<h1>divascans-dl</h1>
-<div class=sub>วางลิงก์ตอน / ลิงก์เรื่อง หรือค้นชื่อ — ตอนฟรี (รวมที่เว็บปลดฟรีแล้ว) โหลดได้ครบทุกหน้า</div>
-<input id=q placeholder="เช่น https://divascans.org/series/comic/love-was-cruel/chapter/12 หรือ love was cruel">
-<div class=bar><button onclick=search()>ค้นหา</button>
-<button class=ghost onclick=openUrl()>เปิดจากลิงก์</button>
-<span id=st style="color:#8996a3;font-size:12px"></span></div>
-<div id=out></div>
-<div class=prog id=prog><i id=pb></i><span id=pt></span></div>
-<div id=err class=err></div>
-</div>
+:root{--pink:#34d399;--bg:#0c1013;--card:#151a1f;--line:#263038;
+ --ease-out:cubic-bezier(.23,1,.32,1);--ease-in-out:cubic-bezier(.77,0,.175,1)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#eee;
+ font-family:'Noto Sans',system-ui,sans-serif}
+header{display:flex;gap:12px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line);
+ position:sticky;top:0;background:rgba(12,16,19,.96);backdrop-filter:blur(6px);z-index:5;flex-wrap:wrap}
+.logo{font-weight:900;font-size:19px;color:var(--pink);letter-spacing:.04em}
+.sub{font-size:12px;color:#8996a3;white-space:nowrap}
+input[type=text]{flex:1;min-width:210px;background:var(--card);border:1px solid var(--line);color:#eee;
+ padding:11px 14px;border-radius:10px;font-size:14px}
+input[type=text]:focus{outline:2px solid var(--pink);outline-offset:-1px}
+button{background:linear-gradient(135deg,#10b981,#047857);color:#fff;border:0;padding:11px 18px;
+ border-radius:10px;font-weight:700;cursor:pointer;transition:transform 160ms var(--ease-out),filter 160ms ease}
+button:active{transform:scale(.97)}
+button:disabled{filter:grayscale(.5);opacity:.65;cursor:wait}
+.back{color:#888;cursor:pointer;font-size:13px}
+main{max-width:920px;margin:0 auto;padding:18px 16px 90px}
+.count{float:right;color:#8996a3;font-size:12px;font-weight:400}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px;margin-top:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;
+ transition:transform 160ms var(--ease-out),border-color 160ms ease}
+@media (hover:hover) and (pointer:fine){.card:hover{transform:translateY(-2px);border-color:var(--pink)}}
+.card img{width:100%;aspect-ratio:3/4;object-fit:cover;display:block;background:#182027}
+.card b{display:block;font-size:13px;padding:8px 10px 2px;line-height:1.35}
+.card span{display:block;font-size:11px;color:#8996a3;padding:0 10px 10px}
+.age{display:inline-block;background:#5a1426;color:#ff94a9;border-radius:4px;padding:1px 5px;font-weight:700}
+.tag{display:inline-block;background:#12291f;color:#8dd3b6;border-radius:4px;padding:1px 5px;font-weight:700}
+.head{display:flex;gap:14px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:14px 0}
+.head img{width:110px;aspect-ratio:3/4;object-fit:cover;border-radius:10px;flex:none;background:#182027}
+.head h2{margin:0 0 6px;font-size:20px}.meta{color:#8dd3b6;font-size:13px;margin:6px 0}
+.synopsis{color:#aab5bf;font-size:12px;line-height:1.5;margin-top:9px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;align-items:center}
+.ep{display:grid;grid-template:1fr/48px 54px 1fr auto auto;gap:10px;align-items:center;
+ border-top:1px solid var(--line);padding:10px 2px}
+.ep .n{font-weight:700;color:var(--pink);text-align:right;white-space:nowrap}
+.ep img{width:54px;aspect-ratio:3/4;object-fit:cover;border-radius:5px;background:#182027}
+.ep .t{font-size:14px}.ep .coin{font-size:12px;color:#ffd166;min-width:120px;text-align:right}
+.ep .free{font-size:12px;color:#7bd88f;min-width:120px;text-align:right}
+.ep .got{font-size:11px;color:#7bd88f}.zip{padding:7px 11px;font-size:12px;border-radius:8px}
+.err{color:#ffb4ab;background:#2a1317;border:1px solid #5b2730;border-radius:10px;padding:10px 12px}
+.frow{display:flex;gap:10px;align-items:center;border-top:1px solid var(--line);padding:9px 2px;cursor:pointer}
+.frow:hover .ft{color:var(--pink)}
+.frow img{width:34px;aspect-ratio:3/4;object-fit:cover;border-radius:4px;background:#182027}
+.ft{font-size:14px;transition:color 160ms ease}.fm{margin-left:auto;font-size:11px;color:#8996a3;white-space:nowrap}
+#toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,140%);opacity:0;background:#131a20;
+ border:1px solid #2b3a44;color:#d7e3ea;padding:11px 16px;border-radius:12px;font-size:13px;z-index:9;
+ box-shadow:0 8px 30px rgba(0,0,0,.5);transition:transform 400ms var(--ease-out),opacity 400ms var(--ease-out);
+ max-width:min(90vw,560px)}
+#toast.on{transform:translate(-50%,0);opacity:1}
+#toast.bad{border-color:#5b2730;color:#ffb4ab}
+.item{opacity:0;transform:translateY(8px);animation:rise 260ms var(--ease-out) forwards}
+@keyframes rise{to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.item{animation:none;opacity:1;transform:none}
+ button,.card{transition:none}}
+</style></head><body>
+<header><div class=logo>DIVASCANS DL</div><span class=sub>Episode ZIP Downloader</span>
+<input id=q type=text placeholder="พิมพ์ชื่อเรื่อง divascans…" aria-label="ค้นหาเรื่อง"><button onclick=search()>ค้นหา</button></header>
+<main id=out></main><div id=toast role=status></div>
 <script>
 const $=id=>document.getElementById(id);
-let CUR=null, TIMER=null;
-async function status(){try{const j=await(await fetch('/api/status')).json();
- $('st').textContent=`${j.series} เรื่อง · cache ${j.cached_series} · เหลือ ${j.disk_free_gb} GB · ${j.api_key?'มี feed key':'ไม่มี feed key'}`}catch(e){}}
-status();
-function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function slugOf(u){const m=(u||'').match(/\\/series\\/(?:comic|novel)\\/([a-z0-9-]+)(?:\\/chapter\\/(\\d+))?/);
- return m?{slug:m[1],n:m[2]}:null}
- async function search(){const q=$('q').value.trim(); if(!q)return;
- const s=slugOf(q); if(s&&s.slug){openSeries(s.slug,s.n);return}
- const j=await(await fetch('/api/series?q='+encodeURIComponent(q))).json();
- let h='';
- (j.items||[]).forEach(t=>{h+=`<div class=card onclick="openSeries('${t.slug}')"><img loading=lazy src="/cover/${t.slug}" onerror="this.style.opacity=.15">
- <div><b>${esc(t.title||t.slug)}</b><div class=meta>${t.type} · ${t.total} ตอน<span class="pill f">ฟรี ${t.free}</span><span class="pill p">จ่าย ${t.paid}</span></div></div></div>`});
- $('out').innerHTML=h||'<p class=meta>ไม่พบเรื่อง</p>';
-}
-function openUrl(){const s=slugOf($('q').value); if(!s){$('err').textContent='วางลิงก์ divascans.org/series/... ก่อน';return}
- openSeries(s.slug,s.n)}
-async function openSeries(slug,pre){
- CUR=slug; const j=await(await fetch('/api/series/'+slug)).json();
- if(j.error){$('out').innerHTML='<p class=meta>'+esc(j.error)+'</p>';return}
- const c=j.catalog||{};
- let h=`<span class=back onclick=search()>← เปลี่ยนเรื่อง</span>
- <div class=card style=cursor:default><img loading=lazy src="/cover/${slug}" onerror="this.style.opacity=.15">
- <div><b>${esc(c.title||slug)}</b><div class=meta>${c.type||''} · ${j.total} ตอน · ฟรี ${j.free}<br><span class=meta>${slug}</span></div></div></div>
- <div class=bar style=margin-top:12px><button onclick="dl()">⬇ โหลดตอนที่เลือกเป็น ZIP</button>
- <span class=chip onclick=selAll(1)>เลือกทั้งหมด</span>
- <span class=chip onclick=selFree()>เลือกตอนฟรี</span>
- <span class=chip onclick=selAll(0)>ล้าง</span>
- <button class=ghost id=stop onclick=stopjob() style=display:none>หยุด</button></div>
- <div class=rows>`;
- j.chapters.forEach(e=>{const t=e.free?'<span class="pill f">ฟรี</span>':'<span class="pill p">จ่าย</span>';
- const ck=e.cached?`<span class="pill f">🗃 ${e.cached}</span>`:'';
- h+=`<div class=ep data-free=${e.free?1:0}><input type=checkbox class=ch value=${e.n}>
- <span class=num>ch ${e.n}</span><span style=flex:1>${esc(e.title)||'—'} ${t}${ck}${e.ea?'<span class=pill>early access</span>':''}</span>
- <span class=chip onclick="view(${e.n})">ดูรูป</span></div>`});
- $('out').innerHTML=h+'</div>';
- if(pre){const el=[...document.querySelectorAll('.ch')].find(x=>x.value==pre); if(el){el.checked=true;dl()}}
-}
-function selAll(v){document.querySelectorAll('.ch').forEach(x=>x.checked=!!v)}
-function selFree(){document.querySelectorAll('.ep').forEach(r=>{const i=r.querySelector('.ch'); if(i)i.checked=r.dataset.free=='1'})}
-async function view(n){$('err').textContent='';
- document.querySelectorAll('.prev').forEach(x=>x.remove());
- const j=await(await fetch(`/api/chapter/${CUR}/${n}`)).json();
- const im=j.images||[];
- const box=document.querySelector('.rows')||$('out');
- if(!im.length){box.insertAdjacentHTML('afterend',`<p class="meta prev">ch ${n}: ไม่มีรปูใน SSR — ตอนน ้ียังไม่ ปลดฟรี (ไฟล ์ยัง ไม่ถูกอั ปขึ้ นเซิร ์ฟเวอร ์)</p>`);return}
- box.insertAdjacentHTML('afterend',`<div class="meta prev" style=margin-top:10px>ch ${n}: ${im.length} หน้ า (cached ${j.cached||0})</div>
- <div class="grid prev">`+im.map(u=>`<img loading=lazy src="/img/${encodeURIComponent(u)}?slug=${CUR}&n=${n}" onerror="this.style.opacity=.2">`).join('')+`</div>`);
-}
-let JOBKEY=null;
-async function dl(){const sel=[...document.querySelectorAll('.ch:checked')].map(x=>+x.value);
- if(!sel.length){$('err').textContent='เลือกตอนก่่อน';return}
- $('err').textContent=''; $('prog').style.display='block'; $('stop').style.display='inline-block';
- document.querySelectorAll('.zipbtn').forEach(x=>x.remove());
- const j=await(await fetch('/api/chapters',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({slug:CUR,chapters:sel})})).json();
- if(j.error){$('err').textContent=j.error;return}
- JOBKEY=j.key; clearInterval(TIMER); TIMER=setInterval(()=>poll(j.key),900);
-}
-async function poll(k){try{const j=await(await fetch('/api/job/'+k)).json();
- const pct=j.total?Math.round(j.done/j.total*100):0;
- $('pb').style.width=pct+'%'; $('pt').textContent=`${j.done}/${j.total} ตอน · ${j.done_pages} หน้ า · ${j.state}`;
- if(j.errors.length)$('err').textContent=j.errors.slice(-6).join('\\n');
- if(j.status!=='running'){clearInterval(TIMER); $('stop').style.display='none';
-  if(j.status==='done')$('prog').insertAdjacentHTML('afterend',
-    `<a class=zipbtn href="/api/job/${k}/zip">📦 ดาวน์โหลด ZIP</a>`);
-  else $('err').textContent='โหลดไม่ ส ำเร็จ: '+j.state}}catch(e){}}
-async function stopjob(){if(JOBKEY)await fetch('/api/job/'+JOBKEY+'/stop',{method:'POST'})}
+const esc=s=>(s+'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp','"':'&quot'}[c]));
+let toastT=0;
+function toast(msg,bad){const t=$('toast');t.textContent=msg;t.classList.toggle('bad',!!bad);t.classList.add('on');
+ clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove('on'),4000)}
+let LASTQ='';
+async function search(){const q=$('q').value.trim();if(!q)return;LASTQ=q;const out=$('out');out.innerHTML='<h3>กำลังค้นหา…</h3>';
+ const r=await fetch('/api/series?'+new URLSearchParams({q}));const j=await r.json();
+ if(!r.ok||j.error){out.innerHTML=`<div class=err>${esc(j.error||'ค้นหาไม่สำเร็จ')}</div>`;return}
+ if(!j.items.length){out.innerHTML='<h3>ไม่พบเรื่อง</h3>';return}
+ let h=`<h3>${esc(q)} <span class=count>${j.items.length} เรื่อง</span></h3><div class=grid>`;
+ j.items.forEach((x,i)=>{h+=`<div class="item card" style="animation-delay:${Math.min(i,12)*40}ms" onclick="openSeries('${esc(x.slug)}')">
+  <img loading=lazy src="/cover/${esc(x.slug)}" onerror="this.hidden=true"><b>${esc(x.title||x.slug)}</b>
+  <span>${esc((x.type||'').toLowerCase())}<br><span class=tag>${x.free||0}/${x.total||0} ฟรี</span>${' '}<span class=age>${esc((x.type||'').startsWith('NOVEL')?'NOVEL':'COMIC')}</span></span></div>`});
+ out.innerHTML=h+'</div>'}
+let SEL=new Set(),EPS=[],CUR='',TITLE='';
+function upd(){const n=SEL.size,b=$('dl');if(b){b.disabled=!n;b.textContent=n?`ดาวน์โหลด ${n} ตอน`:'เลือกตอนก่อน'}
+ document.querySelectorAll('.epc').forEach(x=>{x.checked=SEL.has(+x.value)})}
+function selAll(fn){SEL.clear();EPS.filter(fn).forEach(e=>SEL.add(e.n));upd()}
+async function openSeries(slug){const out=$('out');out.innerHTML='<h3>กำลังโหลดรายละเอียด…</h3>';
+ const r=await fetch('/api/series/'+encodeURIComponent(slug));const j=await r.json();
+ if(!r.ok||j.error){out.innerHTML=`<div class=err>${esc(j.error||'โหลดไม่สำเร็จ')}</div>`;return}
+ CUR=slug;TITLE=j.catalog?.title||slug;EPS=j.chapters||[];SEL.clear();
+ let h=`<span class=back onclick="search()">← กลับผลการค้นหา</span><div class=head>
+  <img src="/cover/${esc(slug)}" onerror="this.hidden=true"><div><h2>${esc(TITLE)}</h2>
+  <div class=meta>Diva · ${EPS.length} ตอน · ฟรี ${j.free}${j.nsfw?' · <span class=age>19+</span>':''}</div>
+  <div class=meta>มีให้ดาวน์โหลด ${j.chapters.filter(c=>c.free||c.cached).length} ตอน</div>
+  <div class=synopsis>${esc(j.desc||'')}</div></div></div>
+  <h3>ตอนทั้งหมด <span class=count>${EPS.length}</span></h3>
+  <div class=bar><button onclick="selAll(c=>c.free||c.cached)">เลือกตอนฟรี</button>
+  <button onclick="selAll(()=>true)">เลือกทั้งหมด</button><button onclick="SEL.clear();upd()">ล้าง</button>
+  <button id=dl onclick="dlSel(this)" disabled>เลือกตอนก่อน</button><button id=st onclick=stopJob() hidden>หยุด</button></div>`;
+ EPS.forEach(e=>{
+  const label=e.title?esc(e.title):'ตอน '+e.n;
+  const right=e.cached?'<span class=free>ดาวน์โหลดแล้ว</span>':(e.free?'<span class=free>ฟรี</span>'
+   :`<span class=coin>${e.eta?('ฟรีหลังอัปเดต ~'+e.eta+' ครั้ง'):''}</span>`);
+  h+=`<div class=ep><label class=n><input class=epc type=checkbox value="${e.n}" onchange="tog(this)">${String(e.n).padStart(2,'0')}</label>
+   <img loading=lazy src="/cover/${esc(slug)}" onerror="this.hidden=true"><span class=t>${label}</span>
+   <span>${e.cached?'<span class=got>✓ </span>':''}${right}</span>
+   <button class=zip onclick="dl([${e.n}],this)">ZIP</button></div>`});
+ out.innerHTML=h;upd()}
+function tog(x){const n=+x.value;SEL.has(n)?SEL.delete(n):SEL.add(n);upd()}
+let JOBK='';
+async function dl(ns,btn){btn.disabled=true;const old=btn.textContent;btn.textContent='กำลังโหลด…';
+ JOBK='';const st=$('st');
+ try{
+  const r=await fetch('/api/chapters',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({slug:CUR,chapters:ns})});
+  const j=await r.json();if(!r.ok)throw new Error(j.error||'ไม่ได้รับงานโหลด');
+  JOBK=j.key;if(st&&btn.id==='dl'){st.hidden=false}
+  let job;
+  while(true){await new Promise(s=>setTimeout(s,1200));
+   job=await(await fetch('/api/job/'+JOBK)).json();
+   if(btn.id==='dl')btn.textContent=`โหลดแล้ว ${job.done}/${job.total} ตอน`;
+   if(job.status!=='running')break}
+  if(job.status!=='done')throw new Error((job.errors||[]).join('; ')||'โหลดไม่สำเร็จ');
+  const zr=await fetch('/api/job/'+JOBK+'/zip');
+  if(!zr.ok)throw new Error('zip หายไป');
+  const blob=await zr.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');
+  a.href=url;a.download=(zr.headers.get('Content-Disposition')||'').match(/filename="?([^";]+)/)?.[1]||'download.zip';
+  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),120000);
+  toast(`เรียบร้อย — ZIP ${(blob.size/1048576).toFixed(1)}MB อยู่ในเครื่องแล้ว`);
+ }catch(e){toast(e.message||'โหลดไม่สำเร็จ',1)}
+ finally{if(st){st.hidden=true}btn.disabled=false;btn.textContent=old;upd()}}
+function dlSel(btn){const ns=[...SEL].sort((a,b)=>a-b);if(ns.length)dl(ns,btn)}
+async function stopJob(){if(JOBK)await fetch('/api/job/'+JOBK+'/stop',{method:'POST'})}
+async function home(){const out=$('out');out.innerHTML='<h3>ค้นหาเรื่องจาก divascans แล้วเลือกตอนเพื่อโหลด ZIP ทีละตอนหรือหลายตอน</h3><div id=feed></div>';
+ try{const j=await(await fetch('/api/feed')).json();const seen=new Set();let h='<h3 style="margin-top:30px">ล่าสุดจาก divascans</h3>';
+  (j.events||[]).forEach(e=>{if(seen.has(e.slug))return;seen.add(e.slug);if(seen.size>14)return;
+   h+=`<div class=frow onclick="openSeries('${esc(e.slug)}')"><img loading=lazy src="/cover/${esc(e.slug)}" onerror="this.hidden=true">
+    <span class=ft>${esc(e.title||e.slug)}</span><span class=fm>${e.event==='became_free'?'ปลดล็อกฟรี':e.event==='published'?'ออกใหม่':''} · ตอน ${e.n}</span></div>`});
+  $('feed').innerHTML=seen.size?h:''}catch(e){}}
+$('q').addEventListener('keydown',e=>{if(e.key==='Enter')search()});
+home();
 </script>"""
 
 if __name__ == "__main__":
