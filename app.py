@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ThreadPoolExecutor as ThreadPool
 
 import requests
 from flask import Flask, Response, abort, jsonify, redirect, request
@@ -582,6 +582,72 @@ def proxy_img(url):
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
+def _store_cover(slug, data, ext):
+    try:
+        with open(os.path.join(DATA_DIR, "covers", f"{slug}.{ext}"), "wb") as fh:
+            fh.write(data)
+        ent = sorted((de.stat().st_mtime, de.path) for de in os.scandir(os.path.join(DATA_DIR, "covers")) if de.is_file())
+        for _, old in ent[:-3000]:  # ~500 MB ceiling on the cover cache
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _cover_kind(data):
+    if data[:2] == b"\xff\xd8":
+        return "jpg"
+    if data[:4] == b"\x89PNG":
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _cover_small(data):
+    """Downscale any cover to a 480px-wide jpg (~30 KB) so 1787 covers cost
+    ~60 MB, not gigabytes. Falls back to the raw bytes when Pillow can't."""
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        if im.width > 480:
+            im = im.resize((480, max(1, im.height * 480 // im.width)), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=78, optimize=True)
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001
+        return data
+
+
+def cover_source(slug):
+    """Fetch the real CDN cover_image; fall back to og-image. Always stored
+    as a small jpg."""
+    src = (CATALOG.get(slug) or {}).get("cover_image")
+    if src and src.startswith("https://media.divascans.org/"):
+        try:
+            r = requests.get(src, headers={"User-Agent": UA_IMG, "Referer": BASE + "/"},
+                             timeout=30)
+            if r.status_code == 200 and _cover_kind(r.content):
+                small = _cover_small(r.content)
+                _store_cover(slug, small, "jpg")
+                return small, "image/jpeg"
+        except requests.RequestException:
+            pass
+    r = requests.get(f"{BASE}/series/{series_fmt(slug)}/{slug}/opengraph-image",
+                     headers={"User-Agent": UA_PAGE, "Referer": BASE + "/"},
+                     timeout=40)
+    if r.status_code != 200 or not _cover_kind(r.content):
+        return None, None
+    small = _cover_small(r.content)
+    _store_cover(slug, small, "jpg")
+    return small, "image/jpeg"
+
+
 @app.get("/cover/<slug>")
 def cover(slug):
     """Series og-image, cached on disk (browser img can't send the Referer CF wants)."""
@@ -589,33 +655,42 @@ def cover(slug):
         abort(404)
     cdir = os.path.join(DATA_DIR, "covers")
     os.makedirs(cdir, exist_ok=True)
-    ext = next((e for e in ("webp", "png", "jpg")
+    ext = next((e for e in ("jpg", "webp", "png")
                 if os.path.exists(os.path.join(cdir, f"{slug}.{e}"))), None)
     if ext:
         with open(os.path.join(cdir, f"{slug}.{ext}"), "rb") as fh:
             data = fh.read()
         return Response(data, mimetype=f"image/{'jpeg' if ext == 'jpg' else ext}",
                         headers={"Cache-Control": "public, max-age=86400"})
-    r = requests.get(f"{BASE}/series/{series_fmt(slug)}/{slug}/opengraph-image",
-                     headers={"User-Agent": UA_PAGE, "Referer": BASE + "/"},
-                     timeout=30)
-    if r.status_code != 200:
+    data, ctype = cover_source(slug)
+    if data is None:
         abort(404)
-    ctype = r.headers.get("Content-Type", "image/png")
-    ext = {"image/webp": "webp", "image/jpeg": "jpg"}.get(ctype, "png")
-    try:
-        with open(os.path.join(cdir, f"{slug}.{ext}"), "wb") as fh:
-            fh.write(r.content)
-        ent = sorted((de.stat().st_mtime, de.path) for de in os.scandir(cdir) if de.is_file())
-        for _, old in ent[:-1000]:  # ~300 MB ceiling on the cover cache
-            try:
-                os.remove(old)
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return Response(r.content, mimetype=ctype,
+    return Response(data, mimetype=ctype,
                     headers={"Cache-Control": "public, max-age=86400"})
+
+
+def warm_covers():
+    """Prefetch every series cover at boot (owner asked for real covers on
+    cards, not lazy on-demand og-images). CDN jpgs, ~120 KB each, bounded."""
+    try:
+        cdir = os.path.join(DATA_DIR, "covers")
+        have = {de.name.rsplit(".", 1)[0] for de in os.scandir(cdir) if de.is_file()}
+    except OSError:
+        have = set()
+    todo = [s for s, r in CATALOG.items()
+            if s not in have and (r.get("title") or r.get("cover_image"))]
+    log(f"cover warmup: {len(todo)} to fetch")
+
+    def one(slug):
+        try:
+            cover_source(slug)
+        except Exception:  # noqa: BLE001
+            pass
+
+    with ThreadPool(6) as ex:
+        for _ in ex.map(one, todo):
+            time.sleep(0.05)
+    log("cover warmup: done")
 
 
 @app.get("/api/feed")
@@ -781,4 +856,5 @@ home();
 </script>"""
 
 if __name__ == "__main__":
+    threading.Thread(target=warm_covers, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, threaded=True)
