@@ -162,6 +162,152 @@ def chapter_images(slug, fmt, n, force=False):
     return 200, body
 
 
+# ------------------------------------------------------- roleascann mirror
+# DivaScans frees chapters slowly; the roleascann/snapvip mirror carries them
+# fresh. cdna.snapvip.xyz/<mirror_slug>/<chapter>/<N>.webp are vertical slices
+# of the whole chapter strip (N=0.., no API, open hotlink): HEAD-probe until
+# the first 404, download, stitch back into page images, cache like any other.
+
+MIRROR_F = os.path.join(DATA_DIR, "mirror_map.jsonl")
+MIRROR_BAKED = os.path.join(APP_ROOT, "mirror_map.jsonl")
+MIRROR_UA = {"User-Agent": UA_IMG, "Referer": "https://roliascann.com/"}
+_mirror = {}
+_mirror_loaded = 0.0
+
+
+def _mirror_load(force=False):
+    global _mirror, _mirror_loaded
+    now = time.time()
+    if not force and now - _mirror_loaded < 600:
+        return
+    merged = {}
+    for f in (MIRROR_BAKED, MIRROR_F):
+        try:
+            for line in open(f, encoding="utf-8"):
+                d = json.loads(line)
+                s = (d.get("mirror_slug") or "").strip()
+                if s and re.fullmatch(r"[a-z0-9][a-z0-9._-]*", s):
+                    merged[d["slug"]] = (s, int(d.get("mirror_max_ch") or 0))
+        except (OSError, ValueError):
+            continue
+    if merged:
+        _mirror = merged
+    _mirror_loaded = now
+
+
+def _mirror_for(slug, n):
+    _mirror_load()
+    r = _mirror.get(slug)
+    return r[0] if r and r[1] >= n else None
+
+
+def _mirror_slices(ms, n):
+    key = ("mir", ms, n)
+    now = time.time()
+    with LOCK:
+        hit = TL.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    urls, miss = [], 0
+    for i in range(500):
+        u = f"https://cdna.snapvip.xyz/{ms}/{n}/{i}.webp"
+        try:
+            h = requests.head(u, headers=MIRROR_UA, timeout=12, allow_redirects=True)
+            code = h.status_code
+        except requests.RequestException:
+            code = -1
+        if code == 200:
+            urls.append(u)
+            miss = 0
+        else:
+            miss += 1
+            if miss >= 3:
+                break
+    with LOCK:
+        TL[key] = (now + (21600 if urls else 600), urls, None)
+    return urls
+
+
+def _stitch(paths, dst_base, maxh=20000):
+    """Join vertical slices into page images of at most maxh px (JPEG caps at
+    65535; ~20k px ≈ one native DivaScans page). Returns the written paths."""
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    w = max(Image.open(p).width for p in paths)
+    outs, y, canvas = [], 0, None
+
+    def flush(idx):
+        nonlocal canvas, y
+        if canvas is not None:
+            dst = f"{dst_base}.{idx:03d}.jpg" if outs or idx > 1 else f"{dst_base}.jpg"
+            canvas.save(dst, "JPEG", quality=80, optimize=True)
+            outs.append(dst)
+            canvas.close()
+            canvas, y = None, 0
+
+    idx = 1
+    for p in paths:
+        im = Image.open(p).convert("RGB")
+        if im.width != w:
+            im = im.resize((w, max(1, im.height * w // im.width)))
+        if canvas is None:
+            canvas = Image.new("RGB", (w, min(im.height, maxh)), (255, 255, 255))
+            y = 0
+        if y + im.height > maxh and y > 0:
+            flush(idx)
+            idx += 1
+            canvas = Image.new("RGB", (w, min(im.height, maxh)), (255, 255, 255))
+            y = 0
+        if canvas.height < y + im.height:
+            bigger = Image.new("RGB", (w, y + im.height), (255, 255, 255))
+            bigger.paste(canvas.crop((0, 0, w, y)), (0, 0))
+            canvas.close()
+            canvas = bigger
+        canvas.paste(im, (0, y))
+        y += im.height
+        im.close()
+    flush(idx)
+    return outs
+
+
+def _mirror_pages(slug, n, fresh):
+    """Locked chapter fallback: mirror slices -> local page files.
+
+    Returns (pairs, total, missing) like get_chapter_files, or None if this
+    chapter is not on the mirror. Stitched into one jpg per chapter when
+    possible; falls back to raw slices if Pillow can't hold the strip.
+    """
+    ms = _mirror_for(slug, n)
+    if not ms:
+        return None
+    urls = _mirror_slices(ms, n)
+    if not urls:
+        return None
+    d = chapter_dir(slug, n)
+    os.makedirs(d, exist_ok=True)
+    todo = [(u, os.path.join(d, f"mirror-{i:04d}.webp")) for i, u in enumerate(urls)]
+    got, missing = [], 0
+    with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
+        for (u, p), (_, ok) in zip(todo, ex.map(lambda t: fetch_image(*t), todo)):
+            if ok:
+                got.append(p)
+                if fresh is not None:
+                    fresh.append(p)
+            else:
+                missing += 1
+    if not got:
+        return None
+    try:
+        pages = _stitch(got, os.path.join(d, f"mirror-{n:03d}-page"))
+        if fresh is not None:
+            fresh.extend(pages)
+        return ([(f"mirror-slices/{n}/{i + 1:03d}.jpg", p) for i, p in enumerate(pages)],
+                len(pages), missing)
+    except Exception:  # noqa: BLE001 — huge strip: serve slices as pages
+        return ([(f"mirror-slices/{n}/{i + 1:03d}.webp", p) for i, p in enumerate(got)],
+                len(got), missing)
+
+
 # ------------------------------------------------------------------- fetching
 
 def page_path(slug, n, img_url):
@@ -222,6 +368,10 @@ def get_chapter_files(slug, n, force=False, fresh=None):
     if st != 200:
         raise RuntimeError(body.get("error", "ssr failed"))
     urls = body["images"]
+    if not urls:
+        mir = _mirror_pages(slug, n, fresh)
+        if mir:
+            return mir
     pairs = [(u, page_path(slug, n, u)) for u in urls]
     todo, seenp = [], set()
     for u, p in pairs:
@@ -549,6 +699,8 @@ def api_chapter(slug, n):
         abort(404)
     st, body = chapter_images(slug, series_fmt(slug), n, force=request.args.get("refresh") == "1")
     body["cached"] = chapter_cached(slug, n)
+    if st == 200 and not body.get("images"):
+        body["mirror"] = bool(_mirror_for(slug, n))
     if st != 200:
         return jsonify(body), st
     return jsonify(body)
