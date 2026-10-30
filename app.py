@@ -290,26 +290,26 @@ def _mirror_pages(slug, n, fresh):
     d = chapter_dir(slug, n)
     os.makedirs(d, exist_ok=True)
     todo = [(u, os.path.join(d, f"mirror-{i:04d}.webp")) for i, u in enumerate(urls)]
-    got, missing = [], 0
     with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
-        for (u, p), (_, ok) in zip(todo, ex.map(lambda t: fetch_image(*t), todo)):
-            if ok:
-                got.append(p)
-                if fresh is not None:
-                    fresh.append(p)
-            else:
-                missing += 1
-    if not got:
-        return None
+        res = list(ex.map(lambda t: fetch_image(*t), todo))
+    bad = [p for (_, p), (_, ok) in zip(todo, res) if not ok]
+    if bad:  # one sequential retry: HEAD passed but the CDN burst-throttled the GETs
+        time.sleep(2)
+        bad = [p for p in bad if not fetch_image(next(u for u, q in todo if q == p), p)[1]]
+    if bad:  # partial too: a silently short zip is worse than a retryable error
+        return None, len(urls), len(bad)
+    got = [p for _, p in todo]
+    if fresh is not None:
+        fresh.extend(got)
     try:
         pages = _stitch(got, os.path.join(d, f"mirror-{n:03d}-page"))
         if fresh is not None:
             fresh.extend(pages)
         return ([(f"mirror-slices/{n}/{i + 1:03d}.jpg", p) for i, p in enumerate(pages)],
-                len(pages), missing)
+                len(pages), 0)
     except Exception:  # noqa: BLE001 — huge strip: serve slices as pages
         return ([(f"mirror-slices/{n}/{i + 1:03d}.webp", p) for i, p in enumerate(got)],
-                len(got), missing)
+                len(got), 0)
 
 
 # ------------------------------------------------------------------- fetching
