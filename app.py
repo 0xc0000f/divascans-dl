@@ -211,11 +211,15 @@ def _mirror_slices(ms, n):
     urls, miss = [], 0
     for i in range(500):
         u = f"https://cdna.snapvip.xyz/{ms}/{n}/{i}.webp"
-        try:
-            h = requests.head(u, headers=MIRROR_UA, timeout=12, allow_redirects=True)
-            code = h.status_code
-        except requests.RequestException:
-            code = -1
+        code = -1
+        for _ in range(2):  # one retry: a transient miss must not truncate the chapter
+            try:
+                h = requests.head(u, headers=MIRROR_UA, timeout=12, allow_redirects=True)
+                code = h.status_code
+            except requests.RequestException:
+                code = -1
+            if code == 200:
+                break
         if code == 200:
             urls.append(u)
             miss = 0
