@@ -674,7 +674,8 @@ def warm_covers():
     cards, not lazy on-demand og-images). CDN jpgs, ~120 KB each, bounded."""
     try:
         cdir = os.path.join(DATA_DIR, "covers")
-        have = {de.name.rsplit(".", 1)[0] for de in os.scandir(cdir) if de.is_file()}
+        have = {de.name[:-4] for de in os.scandir(cdir)
+                if de.is_file() and de.name.endswith(".jpg")}
     except OSError:
         have = set()
     todo = [s for s, r in CATALOG.items()
