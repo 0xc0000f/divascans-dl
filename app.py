@@ -150,7 +150,13 @@ def chapter_images(slug, fmt, n, force=False):
         if u not in seen:
             seen.add(u)
             urls.append(u)
-    body = {"slug": slug, "n": n, "images": urls}
+    # SSR lists full pages (p-<uuid>, w=720) AND vertical slice tiles
+    # (s-<uuid>, w=240) of the same page — only full pages belong in the zip.
+    full = re.compile(r"/(?:\d{1,4}-)?p-[0-9a-f-]{36}\.webp$|/chapters/\d+/\d+\.webp$")
+    keep = [u for u in urls if full.search(u)]
+    if not keep:
+        keep = [u for u in urls if not re.search(r"/(?:\d{1,4}-)?s-[0-9a-f-]{36}\.webp$", u)]
+    body = {"slug": slug, "n": n, "images": keep, "listed": len(urls)}
     with LOCK:
         TL[key] = (now + (3600 if urls else 120), 200, body)
     return 200, body
