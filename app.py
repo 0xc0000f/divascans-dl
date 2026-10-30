@@ -206,8 +206,12 @@ def chapter_cached(slug, n):
     return len([f for f in os.listdir(d) if not f.startswith(".") and not f.endswith(".part")])
 
 
-def get_chapter_files(slug, n, force=False):
-    """Return (ordered list of (img_url, local_path), missing_count)."""
+def get_chapter_files(slug, n, force=False, fresh=None):
+    """Return (ordered list of (img_url, local_path), missing_count).
+
+    Newly downloaded page paths are appended to `fresh` so the job can
+    delete them after the zip is served (nothing accumulates on disk).
+    """
     st, body = chapter_images(slug, series_fmt(slug), n, force=force)
     if st != 200:
         raise RuntimeError(body.get("error", "ssr failed"))
@@ -221,8 +225,12 @@ def get_chapter_files(slug, n, force=False):
     missing = 0
     if todo:
         with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
-            for _, ok in ex.map(lambda t: fetch_image(*t), todo):
-                if not ok:
+            results = zip(todo, ex.map(lambda t: fetch_image(*t), todo))
+            for (u, p), (_, ok) in results:
+                if ok:
+                    if fresh is not None:
+                        fresh.append(p)
+                else:
                     missing += 1
     return pairs, len(urls), missing
 
@@ -268,13 +276,14 @@ def build_zip(slug, chapters, job):
     zname = f"{row.get('title') or slug}.zip"
     zpath = os.path.join(DATA_DIR, "zips", job["key"] + ".zip")
     report = {"series": row.get("title") or slug, "chapters": {}}
+    fresh = job.setdefault("tmp", [])
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:
         for idx, n in enumerate(chapters, 1):
             if job.get("stop"):
                 break
             job["state"] = f"ch {n} ({idx}/{len(chapters)})"
             try:
-                pairs, total, missing = get_chapter_files(slug, n)
+                pairs, total, missing = get_chapter_files(slug, n, fresh=fresh)
             except RuntimeError as e:
                 report["chapters"][str(n)] = {"error": str(e)}
                 job["errors"].append(f"ch{n}: {e}")
@@ -300,12 +309,6 @@ def build_zip(slug, chapters, job):
                 info["missing"] = total - got
                 job["errors"].append(f"ch{n}: {total - got} pages missing")
             report["chapters"][str(n)] = info
-            d = chapter_dir(slug, n)
-            if got == total:
-                try:
-                    open(os.path.join(d, ".complete"), "w").write(str(got))
-                except OSError:
-                    pass
     with zipfile.ZipFile(zpath, "a") as zf:
         zf.writestr("_download_report.json", json.dumps(report, ensure_ascii=False, indent=1))
     job["zpath"] = zpath
@@ -427,6 +430,10 @@ def api_download():
     key = f"{int(time.time()*1000)%10**13:x}{os.getpid()%997:x}"
     JOBS[key] = {"key": key, "slug": slug, "status": "running", "state": "starting",
                  "done": 0, "total": len(ns), "done_pages": 0, "errors": [], "stop": False}
+    try:
+        sweep_stale()
+    except Exception as e:  # noqa: BLE001
+        log("sweep error", repr(e)[:100])
     threading.Thread(target=job_worker, args=(key, slug, sorted(ns)), daemon=True).start()
     return jsonify({"key": key, "chapters": len(ns)})
 
@@ -439,15 +446,50 @@ def api_job(key):
     return jsonify({k: j[k] for k in ("status", "state", "done", "total", "done_pages", "errors")})
 
 
+def _rm_tree_file(p):
+    try:
+        os.remove(p)
+        d = os.path.dirname(p)
+        for _ in range(2):
+            try:
+                os.rmdir(d)
+                d = os.path.dirname(d)
+            except OSError:
+                break
+    except OSError:
+        pass
+
+
+def _drop_job_files(j):
+    """Ephemeral storage: after the zip was served (or aged out), delete
+    the zip and every page this job downloaded. Pre-existing cache stays."""
+    zp = j.pop("zpath", None)
+    if zp:
+        _rm_tree_file(zp)
+    for p in j.pop("tmp", []):
+        _rm_tree_file(p)
+
+
+def sweep_stale():
+    """Delete zip artifacts of abandoned jobs (never fetched) older than 1h."""
+    now = time.time()
+    for j in list(JOBS.values()):
+        zp = j.get("zpath")
+        if zp and j["status"] != "running" and os.path.exists(zp) \
+                and now - os.path.getmtime(zp) > 3600:
+            _drop_job_files(j)
+
+
 @app.get("/api/job/<key>/zip")
 def api_job_zip(key):
     j = JOBS.get(key)
-    if not j or j["status"] != "done":
+    if not j or j["status"] != "done" or not j.get("zpath"):
         abort(404)
     fn = os.path.basename(j.get("zname") or "download.zip")
     ascii_fn = re.sub(r"[^A-Za-z0-9._ -]", "", fn)[:70].strip() or "download.zip"
     quoted = urllib.parse.quote(fn)
     data = open(j["zpath"], "rb").read()
+    _drop_job_files(j)
     return Response(data, mimetype="application/zip",
                     headers={"Content-Disposition":
                              f'attachment; filename="{ascii_fn}"; filename*=UTF-8\'\'{quoted}'})
@@ -477,18 +519,27 @@ def api_chapter(slug, n):
 def proxy_img(url):
     """Proxy image fetch so the browser is never the one talking to Cloudflare.
 
-    With ?slug=&n= the response comes from (or fills) the real chapter cache
-    directory, so previewing also populates downloads/<slug>/ch<n>/.
+    Nothing is stored on disk here (owner request): if the page is already in
+    the chapter cache we serve that, otherwise we stream from the origin.
     """
     if not url.startswith("https://media.divascans.org/"):
         abort(403)
     slug = request.args.get("slug") or "stream"
     n = request.args.get("n") or "0"
     dst = page_path(slug, n, url)
-    p, ok = fetch_image(url, dst)
-    if not ok:
+    try:
+        if os.path.exists(dst) and os.path.getsize(dst) > 0:
+            data = open(dst, "rb").read()
+        else:
+            r = requests.get(url, headers={"User-Agent": UA_IMG, "Referer": BASE + "/"},
+                             timeout=(10, IMG_TIMEOUT))
+            if r.status_code != 200 or not r.content:
+                abort(404)
+            data = r.content
+    except Exception as e:  # noqa: BLE001
+        log("img proxy error", url[:90], repr(e)[:100])
         abort(404)
-    return Response(open(p, "rb").read(), mimetype="image/webp",
+    return Response(data, mimetype="image/webp",
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
@@ -516,6 +567,12 @@ def cover(slug):
     try:
         with open(os.path.join(cdir, f"{slug}.{ext}"), "wb") as fh:
             fh.write(r.content)
+        ent = sorted((de.stat().st_mtime, de.path) for de in os.scandir(cdir) if de.is_file())
+        for _, old in ent[:-1000]:  # ~300 MB ceiling on the cover cache
+            try:
+                os.remove(old)
+            except OSError:
+                pass
     except OSError:
         pass
     return Response(r.content, mimetype=ctype,
