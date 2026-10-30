@@ -217,6 +217,40 @@ def get_chapter_files(slug, n, force=False):
     return pairs, len(urls), missing
 
 
+# --------------------------------------------------------- premium unlock ETA
+# divascans frees the oldest premium chapter on each new publication
+# (free_on_next_release). /api/v1/releases/series gives published_count and
+# free_count, so (n - free_count) updates remain before chapter n turns free.
+
+_WIN_TTL, _win_cache = 300, {}
+_win_lock = threading.Lock()
+
+
+def premium_unlock_in(slug, n):
+    """How many more releases until chapter n is free (None = unknown)."""
+    if not API_KEY or n > 100000:
+        return None
+    now = time.time()
+    with _win_lock:
+        hit = _win_cache.get(slug)
+        if hit and now - hit[1] >= _WIN_TTL:
+            hit = None
+        if hit:
+            pub, free = hit[0]
+        else:
+            try:
+                r = requests.get(f"{BASE}/api/v1/releases/series", params={"series": slug},
+                                 headers={"Authorization": "Bearer " + API_KEY,
+                                          "User-Agent": UA_PAGE}, timeout=15)
+                d = r.json()["data"][0]
+                pub, free = d["published_count"], d["free_count"]
+                _win_cache[slug] = ((pub, free), now)
+            except Exception as e:  # noqa: BLE001
+                log("releases/series error", slug, repr(e)[:100])
+                return None
+    return n - free if free < pub and n <= pub else None
+
+
 # ------------------------------------------------------------------- zip jobs
 
 def build_zip(slug, chapters, job):
@@ -236,8 +270,13 @@ def build_zip(slug, chapters, job):
                 job["errors"].append(f"ch{n}: {e}")
                 continue
             if total == 0:
-                report["chapters"][str(n)] = {"error": "no images (not free yet?)"}
-                job["errors"].append(f"ch{n}: no images")
+                unlock = premium_unlock_in(slug, n)
+                if unlock:
+                    err = f"not free yet — unlocks free after ~{unlock} more update(s)"
+                else:
+                    err = "no images (not free yet?)"
+                report["chapters"][str(n)] = {"error": err}
+                job["errors"].append(f"ch{n}: {err}")
                 continue
             got = 0
             for i, (u, p) in enumerate(pairs, 1):
