@@ -476,14 +476,47 @@ def _drop_job_files(j):
         _rm_tree_file(p)
 
 
+_T0 = time.time()
+
+
 def sweep_stale():
-    """Delete zip artifacts of abandoned jobs (never fetched) older than 1h."""
+    """Delete zip artifacts of abandoned jobs (never fetched) older than 1h.
+
+    Also catches artifacts orphaned by a container restart (JOBS lost):
+    zips older than 1h, and chapter dirs created since boot and untouched
+    for 1h (pre-existing cache dirs are older than boot, never touched).
+    """
     now = time.time()
     for j in list(JOBS.values()):
         zp = j.get("zpath")
         if zp and j["status"] != "running" and os.path.exists(zp) \
                 and now - os.path.getmtime(zp) > 3600:
             _drop_job_files(j)
+    zdir = os.path.join(DATA_DIR, "zips")
+    try:
+        for de in os.scandir(zdir):
+            if de.is_file() and now - de.stat().st_mtime > 3600:
+                _rm_tree_file(de.path)
+    except OSError:
+        pass
+    ddir = os.path.join(DATA_DIR, "downloads")
+    try:
+        for sslug in os.scandir(ddir):
+            if not sslug.is_dir() or sslug.stat().st_mtime <= _T0 - 60:
+                continue  # series dir pre-dates this process: old cache, leave alone
+            for chd in os.scandir(sslug.path):
+                if not (chd.is_dir() and re.fullmatch(r"ch\d+", chd.name)
+                        and _T0 - 60 < chd.stat().st_mtime < now - 3600):
+                    continue
+                for dpf in os.walk(chd.path, topdown=False):
+                    for f in dpf[2]:
+                        _rm_tree_file(os.path.join(dpf[0], f))
+                    try:
+                        os.rmdir(dpf[0])
+                    except OSError:
+                        pass
+    except OSError:
+        pass
 
 
 @app.get("/api/job/<key>/zip")
