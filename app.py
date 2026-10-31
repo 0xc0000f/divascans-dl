@@ -274,6 +274,116 @@ def _stitch(paths, dst_base, maxh=20000):
     return outs
 
 
+# ------------------------------------------------------------------ qtoon
+# Second fallback source (HTTP-only, no JS): qtoon.org. The map (built side
+# of town, re-run every 12h) resolves slug -> readIds; /read/<id> SSR carries
+#  storage.zonatmo.org/qtoon/chapters/en/<id>/<md5>.webp in DOM order, open
+# hotlink. Chain: diva free -> roleascann -> qtoon -> error.
+
+QTOON_F = os.path.join(DATA_DIR, "qtoon_map.jsonl")
+QTOON_BAKED = os.path.join(APP_ROOT, "qtoon_map.jsonl")
+QTOON_IMG_RE = re.compile(
+    r"(?:https?:)?//storage\.zonatmo\.org/qtoon/chapters/en/\d+/[0-9a-f]{16,}\.(?:jpg|jpeg|png|webp)")
+_qtoon = {}
+_qtoon_loaded = 0.0
+
+
+def _qtoon_load(force=False):
+    global _qtoon, _qtoon_loaded
+    now = time.time()
+    if not force and now - _qtoon_loaded < 600:
+        return
+    merged = {}
+    for f in (QTOON_BAKED, QTOON_F):
+        try:
+            for line in open(f, encoding="utf-8"):
+                d = json.loads(line)
+                pid = str(d.get("qtoon_id") or "")
+                pairs = d.get("qtoon_ch_ids") or []
+                if not pid or not pairs:
+                    continue
+                eps = {}
+                for rid, ep in pairs:
+                    try:
+                        eps[int(float(ep))] = str(rid)
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    mx = int(d.get("qtoon_max_ch") or 0)
+                except (TypeError, ValueError):
+                    mx = 0
+                merged[d["slug"]] = (mx, eps)
+        except (OSError, ValueError):
+            continue
+    if merged:
+        _qtoon = merged
+    _qtoon_loaded = now
+
+
+def _qtoon_read_id(slug, n):
+    _qtoon_load()
+    r = _qtoon.get(slug)
+    if not r or r[0] < n:
+        return None
+    return r[1].get(n)
+
+
+def _qtoon_urls(rid):
+    key = ("qtn", str(rid))
+    now = time.time()
+    hit = TL.get(key)
+    if hit and hit[0] > now:
+        return hit[2]
+    try:
+        r = requests.get(f"https://qtoon.org/read/{rid}",
+                         headers={"User-Agent": UA_IMG}, timeout=(10, IMG_TIMEOUT))
+        html = r.text if r.status_code == 200 else ""
+    except requests.RequestException:
+        html = ""
+    seen, urls = set(), []
+    for u in QTOON_IMG_RE.findall(html):
+        u = "https:" + u if u.startswith("//") else u
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    TL[key] = (now + (3600 if urls else 120), 200, urls)
+    return urls
+
+
+def _qtoon_pages(slug, n, fresh):
+    rid = _qtoon_read_id(slug, n)
+    if not rid:
+        return None
+    urls = _qtoon_urls(rid)
+    if not urls:
+        return None
+    d = chapter_dir(slug, n)
+    os.makedirs(d, exist_ok=True)
+    todo = [(u, os.path.join(d, "qtoon-" + f"{i:04d}" + os.path.splitext(u)[-1]))
+            for i, u in enumerate(urls)]
+    with ThreadPoolExecutor(max_workers=DL_WORKERS) as ex:
+        res = list(ex.map(lambda t: fetch_image(*t, referer=""), todo))
+    bad = [p for (_, p), (_, ok) in zip(todo, res) if not ok]
+    if bad:
+        time.sleep(2)
+        bad = [p for p in bad if not fetch_image(next(u for u, q in todo if q == p), p, referer="")[1]]
+    if bad:
+        return None, len(urls), len(bad)
+    got = [p for _, p in todo]
+    if fresh is not None:
+        fresh.extend(got)
+    try:
+        pages = _stitch(got, os.path.join(d, f"qtoon-{n:03d}-page"))
+        if fresh is not None:
+            fresh.extend(pages)
+        return ([(f"qtoon/{n}/{i + 1:03d}.jpg", p) for i, p in enumerate(pages)],
+                len(pages), 0)
+    except Exception:  # noqa: BLE001
+        return ([(f"qtoon/{n}/{i + 1:03d}{os.path.splitext(p)[-1]}", p)
+                for i, p in enumerate(got)],
+                len(got), 0)
+
+
 def _mirror_pages(slug, n, fresh):
     """Locked chapter fallback: mirror slices -> local page files.
 
@@ -319,9 +429,10 @@ def page_path(slug, n, img_url):
     return os.path.join(DATA_DIR, "downloads", slug, f"ch{n}", name)
 
 
-def fetch_image(img_url, dst):
+def fetch_image(img_url, dst, referer=None):
     """Download with browser UA + referer (Cloudflare hotlink guard on new scheme).
 
+    referer="" sends no Referer: zonatmo (qtoon CDN) 403s on a foreign Referer.
     Defensive: any failure -> (dst, False); the .part temp file is always cleaned.
     """
     try:
@@ -330,7 +441,9 @@ def fetch_image(img_url, dst):
             return dst, True
         part = f"{dst}.{os.getpid()}.{threading.get_ident()}.part"
         try:
-            r = requests.get(img_url, headers={"User-Agent": UA_IMG, "Referer": BASE + "/"},
+            hdrs = {"User-Agent": UA_IMG}
+            hdrs["Referer"] = (BASE + "/") if referer is None else referer
+            r = requests.get(img_url, headers=hdrs,
                              stream=True, timeout=(10, IMG_TIMEOUT))
             if r.status_code != 200:
                 return dst, False
@@ -373,9 +486,11 @@ def get_chapter_files(slug, n, force=False, fresh=None):
         raise RuntimeError(body.get("error", "ssr failed"))
     urls = body["images"]
     if not urls:
-        mir = _mirror_pages(slug, n, fresh)
-        if mir:
-            return mir
+        src = ("roleascann", _mirror_pages(slug, n, fresh))
+        if not src[1]:
+            src = ("qtoon", _qtoon_pages(slug, n, fresh))
+        if src[1]:
+            return src[1]
     pairs = [(u, page_path(slug, n, u)) for u in urls]
     todo, seenp = [], set()
     for u, p in pairs:
@@ -704,7 +819,11 @@ def api_chapter(slug, n):
     st, body = chapter_images(slug, series_fmt(slug), n, force=request.args.get("refresh") == "1")
     body["cached"] = chapter_cached(slug, n)
     if st == 200 and not body.get("images"):
-        body["mirror"] = bool(_mirror_for(slug, n))
+        covered = "roleascann" if _mirror_for(slug, n) else (
+            "qtoon" if _qtoon_read_id(slug, n) else "")
+        body["mirror"] = bool(covered)
+        if covered:
+            body["mirror_source"] = covered
     if st != 200:
         return jsonify(body), st
     return jsonify(body)
