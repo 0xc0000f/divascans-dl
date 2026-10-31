@@ -547,6 +547,7 @@ def premium_unlock_in(slug, n):
 # ------------------------------------------------------------------- zip jobs
 
 def build_zip(slug, chapters, job):
+    os.makedirs(os.path.join(DATA_DIR, "zips"), exist_ok=True)
     row = catalog_row(slug)
     zname = f"{row.get('title') or slug}.zip"
     zpath = os.path.join(DATA_DIR, "zips", job["key"] + ".zip")
@@ -726,6 +727,8 @@ def _rm_tree_file(p):
         os.remove(p)
         d = os.path.dirname(p)
         for _ in range(2):
+            if d == DATA_DIR:
+                break
             try:
                 os.rmdir(d)
                 d = os.path.dirname(d)
