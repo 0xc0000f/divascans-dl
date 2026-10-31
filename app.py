@@ -328,6 +328,31 @@ def _qtoon_read_id(slug, n):
     return r[1].get(n)
 
 
+_relay_cache = ["", 0.0]
+
+
+def _qtoon_relay():
+    """HTTP relay base (e.g. http://10.0.1.1:8098/) written to DATA_DIR/qtoon_relay.
+
+    The prod box's IP is zonatmo-blocked (CF error 1005); master's keeper runs an
+    ssh -R relay on an allowed egress that fetches ?<full-url> for us. Marker-file
+    config so it can be switched per machine without a redeploy.
+    """
+    now = time.time()
+    if now - _relay_cache[1] < 60:
+        return _relay_cache[0]
+    base = ""
+    try:
+        with open(os.path.join(DATA_DIR, "qtoon_relay")) as fh:
+            base = fh.read().strip()
+        if base and not base.endswith("/"):
+            base += "/"
+    except OSError:
+        pass
+    _relay_cache[0], _relay_cache[1] = base, now
+    return base
+
+
 def _qtoon_urls(rid):
     key = ("qtn", str(rid))
     now = time.time()
@@ -335,7 +360,7 @@ def _qtoon_urls(rid):
     if hit and hit[0] > now:
         return hit[2]
     try:
-        r = requests.get(f"https://qtoon.org/read/{rid}",
+        r = requests.get(_qtoon_relay() + f"https://qtoon.org/read/{rid}",
                          headers={"User-Agent": UA_IMG}, timeout=(10, IMG_TIMEOUT))
         html = r.text if r.status_code == 200 else ""
     except requests.RequestException:
@@ -442,8 +467,12 @@ def fetch_image(img_url, dst, referer=None):
         part = f"{dst}.{os.getpid()}.{threading.get_ident()}.part"
         try:
             hdrs = {"User-Agent": UA_IMG}
-            hdrs["Referer"] = (BASE + "/") if referer is None else referer
-            r = requests.get(img_url, headers=hdrs,
+            url = img_url
+            if referer is None:
+                hdrs["Referer"] = BASE + "/"
+            elif not referer and _qtoon_relay():
+                url = _qtoon_relay() + img_url
+            r = requests.get(url, headers=hdrs,
                              stream=True, timeout=(10, IMG_TIMEOUT))
             if r.status_code != 200:
                 return dst, False
