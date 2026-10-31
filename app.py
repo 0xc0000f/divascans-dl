@@ -312,6 +312,8 @@ def _qtoon_load(force=False):
                     mx = int(d.get("qtoon_max_ch") or 0)
                 except (TypeError, ValueError):
                     mx = 0
+                if eps:  # mid-scan rows without max_ch: highest known ep still counts
+                    mx = max([mx] + list(eps))
                 merged[d["slug"]] = (mx, eps)
         except (OSError, ValueError):
             continue
