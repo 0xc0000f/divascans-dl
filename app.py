@@ -60,6 +60,7 @@ for _line in open(CATALOG_F, encoding="utf-8"):
 LOCK = threading.Lock()
 JOBS = {}
 TL = {}          # url -> (expires, status, reason)
+MEDIA_403 = 0.0  # last time media.divascans.org answered 403 (bucket outage tell)
 TL_MAX = 400
 
 
@@ -462,6 +463,7 @@ def fetch_image(img_url, dst, referer=None):
     referer="" sends no Referer: zonatmo (qtoon CDN) 403s on a foreign Referer.
     Defensive: any failure -> (dst, False); the .part temp file is always cleaned.
     """
+    global MEDIA_403
     try:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.exists(dst) and os.path.getsize(dst) > 0:
@@ -477,6 +479,8 @@ def fetch_image(img_url, dst, referer=None):
             r = requests.get(url, headers=hdrs,
                              stream=True, timeout=(10, IMG_TIMEOUT))
             if r.status_code != 200:
+                if r.status_code == 403 and "media.divascans.org" in img_url:
+                    MEDIA_403 = time.time()
                 return dst, False
             with open(part, "wb") as fh:
                 for chunk in r.iter_content(65536):
@@ -538,6 +542,12 @@ def get_chapter_files(slug, n, force=False, fresh=None):
                         fresh.append(p)
                 else:
                     missing += 1
+        if missing == len(todo):
+            src = _mirror_pages(slug, n, fresh)
+            if not src[1]:
+                src = _qtoon_pages(slug, n, fresh)
+            if src[1]:
+                return src
     return pairs, len(urls), missing
 
 
@@ -614,7 +624,12 @@ def build_zip(slug, chapters, job):
             info = {"pages": got}
             if total - got:
                 info["missing"] = total - got
-                job["errors"].append(f"ch{n}: {total - got} pages missing")
+                if time.time() - MEDIA_403 < 120:
+                    job["errors"].append(
+                        f"ch{n}: {total - got} pages missing — DivaScans media "
+                        "temporarily unavailable (upstream 403)")
+                else:
+                    job["errors"].append(f"ch{n}: {total - got} pages missing")
             report["chapters"][str(n)] = info
     with zipfile.ZipFile(zpath, "a") as zf:
         zf.writestr("_download_report.json", json.dumps(report, ensure_ascii=False, indent=1))
