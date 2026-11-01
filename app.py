@@ -199,7 +199,11 @@ def _mirror_load(force=False):
 def _mirror_for(slug, n):
     _mirror_load()
     r = _mirror.get(slug)
-    return r[0] if r and r[1] >= n else None
+    try:
+        nf = float(n)
+    except (TypeError, ValueError):
+        return None
+    return r[0] if r and r[1] >= nf else None
 
 
 def _mirror_slices(ms, n):
@@ -326,9 +330,13 @@ def _qtoon_load(force=False):
 def _qtoon_read_id(slug, n):
     _qtoon_load()
     r = _qtoon.get(slug)
-    if not r or r[0] < n:
+    try:
+        nf = float(n)
+    except (TypeError, ValueError):
         return None
-    return r[1].get(n)
+    if not r or r[0] < nf:
+        return None
+    return r[1].get(int(nf)) if nf.is_integer() else None
 
 
 _relay_cache = ["", 0.0]
@@ -503,6 +511,14 @@ def chapter_dir(slug, n):
     return os.path.join(DATA_DIR, "downloads", slug, f"ch{n}")
 
 
+def ch_label(n):
+    s = str(n)
+    if "." in s:
+        i, _, d = s.partition(".")
+        return f"ch{int(i):03d}.{d}"
+    return f"ch{int(s):03d}"
+
+
 def chapter_cached(slug, n):
     d = chapter_dir(slug, n)
     if not os.path.isdir(d):
@@ -617,7 +633,7 @@ def build_zip(slug, chapters, job):
             got = 0
             for i, (u, p) in enumerate(pairs, 1):
                 if os.path.exists(p) and os.path.getsize(p) > 0:
-                    zf.write(p, f"ch{int(n):03d}/{i:03d}-{os.path.basename(p)}")
+                    zf.write(p, f"{ch_label(n)}/{i:03d}-{os.path.basename(p)}")
                     got += 1
             job["done_pages"] += got
             job["done"] += 1
@@ -746,7 +762,12 @@ def api_download():
         slug = m.group(2) if m else ""
     if slug not in CATALOG:
         return jsonify({"error": f"unknown slug: {slug}"}), 404
-    ns = [int(n) for n in (j.get("chapters") or []) if str(n).isdigit()]
+    ns = []
+    for x in (j.get("chapters") or []):
+        m = re.fullmatch(r"\d+(?:\.\d+)?", str(x).strip())
+        if m:
+            ns.append(m.group(0))
+    ns = sorted(dict.fromkeys(ns), key=float)
     if not ns:
         return jsonify({"error": "no chapters selected"}), 400
     key = f"{int(time.time()*1000)%10**13:x}{os.getpid()%997:x}"
@@ -756,7 +777,7 @@ def api_download():
         sweep_stale()
     except Exception as e:  # noqa: BLE001
         log("sweep error", repr(e)[:100])
-    threading.Thread(target=job_worker, args=(key, slug, sorted(ns)), daemon=True).start()
+    threading.Thread(target=job_worker, args=(key, slug, sorted(dict.fromkeys(ns), key=float)), daemon=True).start()
     return jsonify({"key": key, "chapters": len(ns)})
 
 
@@ -861,8 +882,11 @@ def api_job_stop(key):
     return jsonify({"ok": True})
 
 
-@app.get("/api/chapter/<slug>/<int:n>")
+@app.get("/api/chapter/<slug>/<n>")
 def api_chapter(slug, n):
+    if not re.fullmatch(r"\d+(?:\.\d+)?", str(n)):
+        return jsonify({"error": "bad chapter"}), 400
+    n = str(n)
     if slug not in CATALOG:
         abort(404)
     st, body = chapter_images(slug, series_fmt(slug), n, force=request.args.get("refresh") == "1")
